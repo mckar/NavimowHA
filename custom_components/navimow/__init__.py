@@ -254,6 +254,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             此时 api._token 极可能也已失效，需先换新 token 再拉取 MQTT 凭据。
             """
             new_access_token: str | None = None
+            new_auth_headers: dict[str, str] | None = None
             try:
                 # 先刷新 OAuth token（oauth_session 来自外层闭包）
                 if hasattr(oauth_session, "async_ensure_token_valid"):
@@ -267,10 +268,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 if fresh_token and fresh_token.get("access_token"):
                     new_access_token = fresh_token["access_token"]
                     api.set_token(new_access_token)
-                    # 仅更新存储值，不在此触发重连（connected 时 update_credentials 会跳过重连）
-                    sdk.update_mqtt_credentials(
-                        auth_headers={"Authorization": f"Bearer {new_access_token}"}
-                    )
+                    new_auth_headers = {"Authorization": f"Bearer {new_access_token}"}
             except Exception as err:
                 _LOGGER.warning("Failed to refresh OAuth token before MQTT credential refresh: %s", err)
 
@@ -281,13 +279,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 return
             new_username = new_mqtt_info.get("userName")
             new_password = new_mqtt_info.get("pwdInfo")
-            if new_username or new_password:
-                # update_credentials 在断连时会调用 loop_stop()/tls_set() 等阻塞操作，
-                # 必须在 executor 中执行，避免阻塞 HA 事件循环。
+            if new_auth_headers or new_username or new_password:
+                # update_credentials 在断连时会调用 loop_stop()/tls_set()/load_default_certs()
+                # 等阻塞 SSL 操作，必须在 executor 中执行，避免阻塞 HA 事件循环。
+                # auth_headers 更新与 username/password 更新合并为一次 executor 调用。
+                _new_auth_headers = new_auth_headers
+                _new_username = new_username
+                _new_password = new_password
                 def _do_credential_update() -> None:
                     sdk.update_mqtt_credentials(
-                        username=new_username,
-                        password=new_password,
+                        auth_headers=_new_auth_headers,
+                        username=_new_username,
+                        password=_new_password,
                     )
                 await hass.async_add_executor_job(_do_credential_update)
                 _LOGGER.info(
